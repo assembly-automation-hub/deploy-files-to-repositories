@@ -16,6 +16,10 @@ let selectedFiles = [];
 
 function $(id) { return document.getElementById(id); }
 
+function slugify(name) {
+    return name.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "");
+}
+
 function restore() {
     ["repoList", "apiToken", "commitMessage", "extendedDescription", "prBranch", "prTitle", "prBody"].forEach(id => {
         const v = localStorage.getItem(SK[id]);
@@ -299,7 +303,7 @@ async function createPRMultipleFiles(owner, repo, token, filesData, commitMsg, p
     if (!refRes.ok) throw new Error("Cannot read default branch ref");
     const baseSha = (await refRes.json()).object.sha;
 
-    const branch = prBranch || `deploy-${Date.now()}`;
+    const branch = prBranch ? slugify(prBranch) : `deploy-${Date.now()}`;
     const createRefRes = await fetch(`${base}/git/refs`, {
         method: "POST",
         headers,
