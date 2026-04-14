@@ -12,6 +12,8 @@ const SK = {
     prBody: "gfd_prBody"
 };
 
+let selectedFiles = [];
+
 function $(id) { return document.getElementById(id); }
 
 function restore() {
@@ -123,10 +125,6 @@ function parseRepo(raw) {
     return { owner: parts[parts.length - 2], repo: parts[parts.length - 1] };
 }
 
-function slugify(name) {
-    return name.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "");
-}
-
 function apiHeaders(token) {
     return {
         "Authorization": `Bearer ${token}`,
@@ -135,64 +133,183 @@ function apiHeaders(token) {
     };
 }
 
-async function directCommit(owner, repo, token, base64Content, fileName, fullMessage) {
-    const apiUrl = `https://api.github.com/repos/${owner}/${repo}/contents/${encodeURIComponent(fileName)}`;
-    const headers = apiHeaders(token);
-
-    let sha = null;
-    const getRes = await fetch(apiUrl, { method: "GET", headers });
-    if (getRes.ok) {
-        sha = (await getRes.json()).sha;
-    } else if (getRes.status !== 404) {
-        throw new Error((await getRes.json()).message || "Failed to check file");
+async function getFilesFromDataTransfer(items) {
+    const files = [];
+    const queue = [];
+    for (let i = 0; i < items.length; i++) {
+        if (items[i].kind === 'file') {
+            const entry = items[i].webkitGetAsEntry();
+            if (entry) queue.push(entry);
+        }
     }
 
-    const body = { message: fullMessage, content: base64Content };
-    if (sha) body.sha = sha;
-
-    const putRes = await fetch(apiUrl, { method: "PUT", headers, body: JSON.stringify(body) });
-    if (!putRes.ok) throw new Error((await putRes.json()).message || "Failed to write");
-
-    const data = await putRes.json();
-    return { action: sha ? "updated" : "created", url: data.commit.html_url };
+    while (queue.length > 0) {
+        const entry = queue.shift();
+        if (entry.isFile) {
+            const file = await new Promise(res => entry.file(res));
+            file.customPath = entry.fullPath.replace(/^\//, '');
+            files.push(file);
+        } else if (entry.isDirectory) {
+            const reader = entry.createReader();
+            let hasMore = true;
+            while (hasMore) {
+                const entries = await new Promise(res => reader.readEntries(res));
+                if (entries.length > 0) {
+                    queue.push(...entries);
+                } else {
+                    hasMore = false;
+                }
+            }
+        }
+    }
+    return files;
 }
 
-async function createPR(owner, repo, token, base64Content, fileName, commitMsg, prBranch, prTitle, prBody) {
+function updateFileLabel() {
+    const label = $("fileDropLabel");
+    const commitMsg = $("commitMessage");
+    
+    if (selectedFiles.length === 0) {
+        label.innerHTML = `<svg width="20" height="20" viewBox="0 0 16 16" fill="currentColor"><path d="M2.75 14A1.75 1.75 0 0 1 1 12.25v-2.5a.75.75 0 0 1 1.5 0v2.5c0 .138.112.25.25.25h10.5a.25.25 0 0 0 .25-.25v-2.5a.75.75 0 0 1 1.5 0v2.5A1.75 1.75 0 0 1 13.25 14ZM11.28 4.72a.749.749 0 1 1-1.06 1.06L8.75 4.31v6.94a.75.75 0 0 1-1.5 0V4.31L5.78 5.78a.749.749 0 1 1-1.06-1.06l3-3a.75.75 0 0 1 1.06 0Z"/></svg><span>Choose files or drag files/folders here</span>`;
+        label.classList.remove("has-file");
+        return;
+    }
+
+    label.innerHTML = `<svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor"><path d="M2 1.75C2 .784 2.784 0 3.75 0h6.586c.464 0 .909.184 1.237.513l2.914 2.914c.329.328.513.773.513 1.237v9.586A1.75 1.75 0 0 1 13.25 16h-9.5A1.75 1.75 0 0 1 2 14.25Zm1.75-.25a.25.25 0 0 0-.25.25v12.5c0 .138.112.25.25.25h9.5a.25.25 0 0 0 .25-.25V6h-2.75A1.75 1.75 0 0 1 9 4.25V1.5Zm6.75.062V4.25c0 .138.112.25.25.25h2.688l-.011-.013-2.914-2.914-.013-.011Z"/></svg><span>${selectedFiles.length} file(s) ready</span>`;
+    label.classList.add("has-file");
+    
+    commitMsg.value = selectedFiles.length === 1 ? `Add ${selectedFiles[0].customPath}` : `Add ${selectedFiles.length} files`;
+    localStorage.setItem(SK.commitMessage, commitMsg.value);
+}
+
+function initFileDrop() {
+    const drop = $("fileDrop");
+    const input = $("fileInput");
+
+    input.addEventListener("change", () => {
+        if (input.files.length > 0) {
+            selectedFiles = Array.from(input.files).map(f => {
+                f.customPath = f.webkitRelativePath || f.name;
+                return f;
+            });
+            updateFileLabel();
+        }
+    });
+
+    drop.addEventListener("dragover", e => { e.preventDefault(); drop.classList.add("dragover"); });
+    drop.addEventListener("dragleave", () => drop.classList.remove("dragover"));
+    drop.addEventListener("drop", async e => {
+        e.preventDefault();
+        drop.classList.remove("dragover");
+        if (e.dataTransfer.items) {
+            selectedFiles = await getFilesFromDataTransfer(e.dataTransfer.items);
+        } else if (e.dataTransfer.files) {
+            selectedFiles = Array.from(e.dataTransfer.files).map(f => {
+                f.customPath = f.webkitRelativePath || f.name;
+                return f;
+            });
+        }
+        updateFileLabel();
+    });
+}
+
+function initCoauthorSearch() {
+    $("coauthorSearch").addEventListener("input", e => {
+        const q = e.target.value.toLowerCase();
+        document.querySelectorAll(".coauthor-item").forEach(item => {
+            item.classList.toggle("filter-hidden", q && !item.dataset.login.includes(q));
+        });
+    });
+}
+
+async function commitMultipleFiles(owner, repo, token, filesData, message, branchName = null) {
+    const headers = apiHeaders(token);
+    const base = `https://api.github.com/repos/${owner}/${repo}`;
+
+    let targetBranch = branchName;
+    if (!targetBranch) {
+        const repoRes = await fetch(base, { headers });
+        if (!repoRes.ok) throw new Error((await repoRes.json()).message || "Cannot access repo");
+        targetBranch = (await repoRes.json()).default_branch;
+    }
+
+    const refRes = await fetch(`${base}/git/ref/heads/${targetBranch}`, { headers });
+    if (!refRes.ok) throw new Error("Cannot read branch ref");
+    const latestCommitSha = (await refRes.json()).object.sha;
+
+    const commitRes = await fetch(`${base}/git/commits/${latestCommitSha}`, { headers });
+    const baseTreeSha = (await commitRes.json()).tree.sha;
+
+    const tree = [];
+    for (const file of filesData) {
+        const blobRes = await fetch(`${base}/git/blobs`, {
+            method: 'POST',
+            headers,
+            body: JSON.stringify({ content: file.content, encoding: 'base64' })
+        });
+        if (!blobRes.ok) throw new Error("Failed to create blob for " + file.path);
+        
+        tree.push({
+            path: file.path,
+            mode: '100644',
+            type: 'blob',
+            sha: (await blobRes.json()).sha
+        });
+    }
+
+    const createTreeRes = await fetch(`${base}/git/trees`, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({ base_tree: baseTreeSha, tree })
+    });
+    if (!createTreeRes.ok) throw new Error("Failed to create tree structure");
+    const newTreeData = await createTreeRes.json();
+
+    const createCommitRes = await fetch(`${base}/git/commits`, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({
+            message: message,
+            tree: newTreeData.sha,
+            parents: [latestCommitSha]
+        })
+    });
+    if (!createCommitRes.ok) throw new Error("Failed to create commit");
+    const newCommitData = await createCommitRes.json();
+
+    const updateRefRes = await fetch(`${base}/git/refs/heads/${targetBranch}`, {
+        method: 'PATCH',
+        headers,
+        body: JSON.stringify({ sha: newCommitData.sha })
+    });
+    if (!updateRefRes.ok) throw new Error("Failed to update branch reference");
+
+    return { action: "committed", url: newCommitData.html_url };
+}
+
+async function createPRMultipleFiles(owner, repo, token, filesData, commitMsg, prBranch, prTitle, prBody) {
     const headers = apiHeaders(token);
     const base = `https://api.github.com/repos/${owner}/${repo}`;
 
     const repoRes = await fetch(base, { headers });
     if (!repoRes.ok) throw new Error((await repoRes.json()).message || "Cannot access repo");
-    const repoData = await repoRes.json();
-    const defaultBranch = repoData.default_branch;
+    const defaultBranch = (await repoRes.json()).default_branch;
 
     const refRes = await fetch(`${base}/git/ref/heads/${defaultBranch}`, { headers });
     if (!refRes.ok) throw new Error("Cannot read default branch ref");
-    const refData = await refRes.json();
-    const baseSha = refData.object.sha;
+    const baseSha = (await refRes.json()).object.sha;
 
-    const branch = prBranch || `add-${slugify(fileName)}-${Date.now()}`;
-
+    const branch = prBranch || `deploy-${Date.now()}`;
     const createRefRes = await fetch(`${base}/git/refs`, {
         method: "POST",
         headers,
         body: JSON.stringify({ ref: `refs/heads/${branch}`, sha: baseSha })
     });
     if (!createRefRes.ok) {
-        const err = await createRefRes.json();
-        throw new Error(err.message || "Failed to create branch");
+        throw new Error((await createRefRes.json()).message || "Failed to create branch");
     }
 
-    const contentsUrl = `${base}/contents/${encodeURIComponent(fileName)}`;
-    let sha = null;
-    const checkRes = await fetch(`${contentsUrl}?ref=${branch}`, { headers });
-    if (checkRes.ok) sha = (await checkRes.json()).sha;
-
-    const putBody = { message: commitMsg, content: base64Content, branch };
-    if (sha) putBody.sha = sha;
-
-    const putRes = await fetch(contentsUrl, { method: "PUT", headers, body: JSON.stringify(putBody) });
-    if (!putRes.ok) throw new Error((await putRes.json()).message || "Failed to commit to branch");
+    await commitMultipleFiles(owner, repo, token, filesData, commitMsg, branch);
 
     const prRes = await fetch(`${base}/pulls`, {
         method: "POST",
@@ -206,45 +323,8 @@ async function createPR(owner, repo, token, base64Content, fileName, commitMsg, 
     });
 
     if (!prRes.ok) throw new Error((await prRes.json()).message || "Failed to create PR");
-
     const prData = await prRes.json();
     return { url: prData.html_url, number: prData.number };
-}
-
-function initFileDrop() {
-    const drop = $("fileDrop");
-    const input = $("fileInput");
-    const label = $("fileDropLabel");
-    const commitMsg = $("commitMessage");
-
-    function showFile(file) {
-        label.innerHTML = `<svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor"><path d="M2 1.75C2 .784 2.784 0 3.75 0h6.586c.464 0 .909.184 1.237.513l2.914 2.914c.329.328.513.773.513 1.237v9.586A1.75 1.75 0 0 1 13.25 16h-9.5A1.75 1.75 0 0 1 2 14.25Zm1.75-.25a.25.25 0 0 0-.25.25v12.5c0 .138.112.25.25.25h9.5a.25.25 0 0 0 .25-.25V6h-2.75A1.75 1.75 0 0 1 9 4.25V1.5Zm6.75.062V4.25c0 .138.112.25.25.25h2.688l-.011-.013-2.914-2.914-.013-.011Z"/></svg><span>${file.name}</span>`;
-        label.classList.add("has-file");
-        commitMsg.value = `Add ${file.name}`;
-        localStorage.setItem(SK.commitMessage, commitMsg.value);
-    }
-
-    input.addEventListener("change", () => { if (input.files[0]) showFile(input.files[0]); });
-
-    drop.addEventListener("dragover", e => { e.preventDefault(); drop.classList.add("dragover"); });
-    drop.addEventListener("dragleave", () => drop.classList.remove("dragover"));
-    drop.addEventListener("drop", e => {
-        e.preventDefault();
-        drop.classList.remove("dragover");
-        if (e.dataTransfer.files.length) {
-            input.files = e.dataTransfer.files;
-            showFile(e.dataTransfer.files[0]);
-        }
-    });
-}
-
-function initCoauthorSearch() {
-    $("coauthorSearch").addEventListener("input", e => {
-        const q = e.target.value.toLowerCase();
-        document.querySelectorAll(".coauthor-item").forEach(item => {
-            item.classList.toggle("filter-hidden", q && !item.dataset.login.includes(q));
-        });
-    });
 }
 
 document.addEventListener("DOMContentLoaded", () => {
@@ -262,7 +342,6 @@ document.addEventListener("DOMContentLoaded", () => {
         e.preventDefault();
 
         const token = $("apiToken").value.trim();
-        const fileInput = $("fileInput").files[0];
         const commitMessage = $("commitMessage").value.trim();
         const extendedDesc = $("extendedDescription").value.trim();
         const repoListText = $("repoList").value;
@@ -272,7 +351,10 @@ document.addEventListener("DOMContentLoaded", () => {
 
         statusLog.innerHTML = "";
 
-        if (!fileInput) { addLog("System", "Please select a file.", "error"); return; }
+        if (selectedFiles.length === 0) {
+            addLog("System", "Please select files or drag folders.", "error");
+            return;
+        }
 
         const repos = repoListText.split("\n").map(r => r.trim()).filter(Boolean);
         if (!repos.length) { addLog("System", "Repository list is empty.", "error"); return; }
@@ -284,11 +366,18 @@ document.addEventListener("DOMContentLoaded", () => {
         progressTrack.innerHTML = '<div class="progress-bar-fill"></div>';
         statusLog.appendChild(progressTrack);
 
-        const reader = new FileReader();
-        reader.onload = async event => {
-            const content = event.target.result;
-            const base64Content = btoa(unescape(encodeURIComponent(content)));
-            const fileName = fileInput.name;
+        try {
+            const filesData = await Promise.all(selectedFiles.map(async f => {
+                const b64 = await new Promise((resolve) => {
+                    const reader = new FileReader();
+                    reader.onload = event => {
+                        const base64 = event.target.result.split(',')[1];
+                        resolve(base64);
+                    };
+                    reader.readAsDataURL(f);
+                });
+                return { path: f.customPath || f.name, content: b64 };
+            }));
 
             let msgParts = [commitMessage];
             if (extendedDesc) msgParts.push(extendedDesc);
@@ -297,7 +386,7 @@ document.addEventListener("DOMContentLoaded", () => {
             const fullMessage = msgParts.join("\n\n");
 
             const modeLabel = method === "pr" ? "pull requests" : "commits";
-            addLog("System", `Deploying <strong>${fileName}</strong> as ${modeLabel} to ${repos.length} repositor${repos.length === 1 ? "y" : "ies"}`, "info");
+            addLog("System", `Deploying ${filesData.length} item(s) as ${modeLabel} to ${repos.length} repositor${repos.length === 1 ? "y" : "ies"}`, "info");
 
             for (let i = 0; i < repos.length; i++) {
                 const parsed = parseRepo(repos[i]);
@@ -307,15 +396,16 @@ document.addEventListener("DOMContentLoaded", () => {
                     continue;
                 }
                 const name = `${parsed.owner}/${parsed.repo}`;
+                
                 try {
                     if (method === "pr") {
                         const prBranch = $("prBranch").value.trim();
                         const prTitle = $("prTitle").value.trim();
                         const prBody = $("prBody").value.trim();
-                        const result = await createPR(parsed.owner, parsed.repo, token, base64Content, fileName, fullMessage, prBranch, prTitle || commitMessage, prBody);
+                        const result = await createPRMultipleFiles(parsed.owner, parsed.repo, token, filesData, fullMessage, prBranch, prTitle || commitMessage, prBody);
                         addLog(name, `PR #${result.number} created &mdash; <a href="${result.url}" target="_blank" rel="noopener">view</a>`, "success");
                     } else {
-                        const result = await directCommit(parsed.owner, parsed.repo, token, base64Content, fileName, fullMessage);
+                        const result = await commitMultipleFiles(parsed.owner, parsed.repo, token, filesData, fullMessage);
                         addLog(name, `${result.action} &mdash; <a href="${result.url}" target="_blank" rel="noopener">view commit</a>`, "success");
                     }
                 } catch (err) {
@@ -323,11 +413,11 @@ document.addEventListener("DOMContentLoaded", () => {
                 }
                 updateProgress(i + 1, repos.length);
             }
+        } catch (error) {
+            addLog("System", "Failed to process files: " + error.message, "error");
+        }
 
-            submitBtn.disabled = false;
-            addLog("System", "Done.", "info");
-        };
-
-        reader.readAsText(fileInput);
+        submitBtn.disabled = false;
+        addLog("System", "Done.", "info");
     });
 });
