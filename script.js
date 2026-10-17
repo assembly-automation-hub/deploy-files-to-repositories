@@ -1,5 +1,8 @@
 import KNOWN_BOTS from "./bots.js";
 
+// localStorage keys for persisted form state.
+// Note: the PAT is stored in cleartext by design (client-side only tool);
+// the XSS hardening below is what keeps that acceptable.
 const SK = {
     repoList: "gfd_repoList",
     apiToken: "gfd_apiToken",
@@ -12,21 +15,34 @@ const SK = {
     prBody: "gfd_prBody"
 };
 
+const PERSISTED_IDS = ["repoList", "apiToken", "commitMessage", "extendedDescription", "prBranch", "prTitle", "prBody"];
+const DEPLOY_METHODS = ["commit", "pr"];
+const LOG_TYPES = new Set(["info", "success", "error", "warn"]);
+
+// GitHub naming rules, used to reject malformed input before it is ever
+// interpolated into API URLs.
+const OWNER_RE = /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})$/;
+const REPO_RE = /^[A-Za-z0-9._-]{1,100}$/;
+
+const ICON_UPLOAD = `<svg width="20" height="20" viewBox="0 0 16 16" fill="currentColor"><path d="M2.75 14A1.75 1.75 0 0 1 1 12.25v-2.5a.75.75 0 0 1 1.5 0v2.5c0 .138.112.25.25.25h10.5a.25.25 0 0 0 .25-.25v-2.5a.75.75 0 0 1 1.5 0v2.5A1.75 1.75 0 0 1 13.25 14ZM11.28 4.72a.749.749 0 1 1-1.06 1.06L8.75 4.31v6.94a.75.75 0 0 1-1.5 0V4.31L5.78 5.78a.749.749 0 1 1-1.06-1.06l3-3a.75.75 0 0 1 1.06 0Z"/></svg>`;
+const ICON_FILE = `<svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor"><path d="M2 1.75C2 .784 2.784 0 3.75 0h6.586c.464 0 .909.184 1.237.513l2.914 2.914c.329.328.513.773.513 1.237v9.586A1.75 1.75 0 0 1 13.25 16h-9.5A1.75 1.75 0 0 1 2 14.25Zm1.75-.25a.25.25 0 0 0-.25.25v12.5c0 .138.112.25.25.25h9.5a.25.25 0 0 0 .25-.25V6h-2.75A1.75 1.75 0 0 1 9 4.25V1.5Zm6.75.062V4.25c0 .138.112.25.25.25h2.688l-.011-.013-2.914-2.914-.013-.011Z"/></svg>`;
+
 let selectedFiles = [];
 
 function $(id) { return document.getElementById(id); }
 
 function slugify(name) {
-    return name.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "");
+    return name.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "");
 }
 
 function restore() {
-    ["repoList", "apiToken", "commitMessage", "extendedDescription", "prBranch", "prTitle", "prBody"].forEach(id => {
+    PERSISTED_IDS.forEach(id => {
         const v = localStorage.getItem(SK[id]);
         if (v !== null && $(id)) $(id).value = v;
     });
-    const method = localStorage.getItem(SK.deployMethod) || "commit";
-    setDeployMethod(method);
+    // Ignore corrupted/unknown values stored by older versions.
+    const saved = localStorage.getItem(SK.deployMethod);
+    setDeployMethod(DEPLOY_METHODS.includes(saved) ? saved : "commit");
 }
 
 function persist(id) {
@@ -52,7 +68,7 @@ function setDeployMethod(val) {
 function buildCoauthorGrid() {
     const grid = $("coauthorGrid");
     let saved = [];
-    try { saved = JSON.parse(localStorage.getItem(SK.selectedBots) || "[]"); } catch {}
+    try { saved = JSON.parse(localStorage.getItem(SK.selectedBots) || "[]"); } catch { /* Corrupted storage: select none. */ }
 
     KNOWN_BOTS.forEach(bot => {
         const item = document.createElement("label");
@@ -66,7 +82,7 @@ function buildCoauthorGrid() {
 
         const avatar = document.createElement("img");
         avatar.className = "coauthor-avatar";
-        avatar.src = `https://github.com/${bot.login.replace("[bot]", "%5Bbot%5D")}.png?size=40`;
+        avatar.src = `https://github.com/${encodeURIComponent(bot.login)}.png?size=40`;
         avatar.alt = "";
         avatar.loading = "lazy";
         avatar.onerror = function() { this.style.display = "none"; };
@@ -108,40 +124,141 @@ function getCoauthorTrailers() {
     });
 }
 
-function addLog(target, message, type) {
+// Only allows https links back to GitHub. html_url values come from API
+// responses and must never be able to smuggle in javascript: or external URLs.
+function sanitizeExternalUrl(url) {
+    try {
+        const parsed = new URL(url);
+        if (parsed.protocol !== "https:") return null;
+        if (parsed.hostname !== "github.com" && !parsed.hostname.endsWith(".github.com")) return null;
+        return parsed.href;
+    } catch {
+        return null;
+    }
+}
+
+function addLog(target, message, type = "info", link = null) {
     const log = $("statusLog");
     const entry = document.createElement("div");
-    entry.className = `log-entry log-${type}`;
-    entry.innerHTML = `<strong>${target}:</strong> <span>${message}</span>`;
+    // Whitelist log types so `type` can never inject unexpected class names.
+    entry.className = `log-entry log-${LOG_TYPES.has(type) ? type : "info"}`;
+
+    const title = document.createElement("strong");
+    title.textContent = `${target}:`;
+
+    // Built with textContent, never innerHTML: API error messages, repo names
+    // and commit URLs are untrusted input and must not inject markup into a
+    // page that also holds the user's access token.
+    const body = document.createElement("span");
+    body.textContent = message;
+
+    if (link) {
+        const safeUrl = sanitizeExternalUrl(link.url);
+        if (safeUrl) {
+            body.appendChild(document.createTextNode(" — "));
+            const anchor = document.createElement("a");
+            anchor.href = safeUrl;
+            anchor.target = "_blank";
+            anchor.rel = "noopener noreferrer";
+            anchor.textContent = link.label;
+            body.appendChild(anchor);
+        }
+    }
+
+    entry.append(title, body);
     log.appendChild(entry);
     entry.scrollIntoView({ behavior: "smooth", block: "nearest" });
 }
 
 function updateProgress(current, total) {
     const fill = document.querySelector(".progress-bar-fill");
-    if (fill) fill.style.width = `${(current / total) * 100}%`;
+    if (!fill || total <= 0) return;
+    fill.style.width = `${Math.min(100, (current / total) * 100)}%`;
 }
 
 function parseRepo(raw) {
-    let clean = raw.replace(/^(https?:\/\/)?(github\.com\/)?/, "").replace(/\/$/, "");
-    const parts = clean.split("/");
-    if (parts.length < 2) return null;
-    return { owner: parts[parts.length - 2], repo: parts[parts.length - 1] };
+    const trimmed = raw.trim();
+    if (!trimmed) return null;
+
+    const urlMatch = trimmed.match(/^(?:https?:\/\/)?(?:www\.)?github\.com\/(.+)$/i);
+    let segments;
+    if (urlMatch) {
+        // Full GitHub URL: take the first two path segments (owner/repo) and
+        // ignore any deeper path (/pulls, /tree/main), query or fragment.
+        segments = urlMatch[1].split(/[?#]/)[0].split("/").filter(Boolean).slice(0, 2);
+    } else {
+        // Shorthand form: must be exactly "owner/repo".
+        segments = trimmed.split("/").filter(Boolean);
+        if (segments.length !== 2) return null;
+    }
+    if (segments.length < 2) return null;
+
+    const [owner, rawRepo] = segments;
+    const repo = rawRepo.replace(/\.git$/i, "");
+    if (!OWNER_RE.test(owner) || !REPO_RE.test(repo) || !repo.replace(/\./g, "")) return null;
+    return { owner, repo };
 }
 
 function apiHeaders(token) {
     return {
         "Authorization": `Bearer ${token}`,
         "Accept": "application/vnd.github+json",
-        "X-GitHub-Api-Version": "2022-11-28"
+        "X-GitHub-Api-Version": "2022-11-28",
+        "Content-Type": "application/json"
     };
 }
 
-async function getFilesFromDataTransfer(items) {
+// Builds a descriptive Error from a failed API response. The body is consumed
+// exactly once (it cannot be read twice) and may not be JSON at all.
+async function apiError(response, fallback) {
+    let detail = "";
+    try {
+        const data = await response.json();
+        if (data && typeof data.message === "string") detail = data.message;
+    } catch { /* Non-JSON body; the status line alone is still useful. */ }
+    const status = `${response.status} ${response.statusText}`.trim();
+    return new Error(`${fallback} (${status}${detail ? `: ${detail}` : ""})`);
+}
+
+// fetch() wrapper for the GitHub API: throws an Error carrying the API's own
+// message on failure and resolves with the parsed JSON body on success.
+async function ghFetch(url, options, fallback) {
+    const response = await fetch(url, options);
+    if (!response.ok) throw await apiError(response, fallback);
+    return response.json();
+}
+
+function repoApiBase(owner, repo) {
+    // Names are validated by parseRepo; encodeURIComponent is defense in depth.
+    return `https://api.github.com/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}`;
+}
+
+// Normalizes a file path for the Git tree API: forward slashes only, no empty,
+// "." or ".." segments that the API would reject (or that could confuse tools cloning the repo).
+function sanitizeRepoPath(path) {
+    return String(path).replace(/\\/g, "/").split("/")
+        .filter(segment => segment && segment !== "." && segment !== "..")
+        .join("/");
+}
+
+function withCustomPath(file) {
+    file.customPath = file.webkitRelativePath || file.name;
+    return file;
+}
+
+async function getFilesFromDataTransfer(dataTransfer) {
+    const items = dataTransfer.items;
+    // Browsers without webkitGetAsEntry (e.g. Firefox) cannot traverse dropped
+    // directories; fall back to the flat file list instead of crashing.
+    const canTraverse = items.length > 0 && typeof items[0].webkitGetAsEntry === "function";
+    if (!canTraverse) {
+        return Array.from(dataTransfer.files).map(withCustomPath);
+    }
+
     const files = [];
     const queue = [];
     for (let i = 0; i < items.length; i++) {
-        if (items[i].kind === 'file') {
+        if (items[i].kind === "file") {
             const entry = items[i].webkitGetAsEntry();
             if (entry) queue.push(entry);
         }
@@ -150,20 +267,18 @@ async function getFilesFromDataTransfer(items) {
     while (queue.length > 0) {
         const entry = queue.shift();
         if (entry.isFile) {
-            const file = await new Promise(res => entry.file(res));
-            file.customPath = entry.fullPath.replace(/^\//, '');
+            // Reject on error so one unreadable entry cannot hang the drop forever.
+            const file = await new Promise((resolve, reject) => entry.file(resolve, reject));
+            file.customPath = entry.fullPath.replace(/^\/+/, "");
             files.push(file);
         } else if (entry.isDirectory) {
             const reader = entry.createReader();
-            let hasMore = true;
-            while (hasMore) {
-                const entries = await new Promise(res => reader.readEntries(res));
-                if (entries.length > 0) {
-                    queue.push(...entries);
-                } else {
-                    hasMore = false;
-                }
-            }
+            // readEntries returns batches; an empty batch means the directory is done.
+            let entries;
+            do {
+                entries = await new Promise((resolve, reject) => reader.readEntries(resolve, reject));
+                queue.push(...entries);
+            } while (entries.length > 0);
         }
     }
     return files;
@@ -172,16 +287,18 @@ async function getFilesFromDataTransfer(items) {
 function updateFileLabel() {
     const label = $("fileDropLabel");
     const commitMsg = $("commitMessage");
-    
+
     if (selectedFiles.length === 0) {
-        label.innerHTML = `<svg width="20" height="20" viewBox="0 0 16 16" fill="currentColor"><path d="M2.75 14A1.75 1.75 0 0 1 1 12.25v-2.5a.75.75 0 0 1 1.5 0v2.5c0 .138.112.25.25.25h10.5a.25.25 0 0 0 .25-.25v-2.5a.75.75 0 0 1 1.5 0v2.5A1.75 1.75 0 0 1 13.25 14ZM11.28 4.72a.749.749 0 1 1-1.06 1.06L8.75 4.31v6.94a.75.75 0 0 1-1.5 0V4.31L5.78 5.78a.749.749 0 1 1-1.06-1.06l3-3a.75.75 0 0 1 1.06 0Z"/></svg><span>Choose files or drag files/folders here</span>`;
+        // label content below is fully static markup; the only interpolated
+        // value in this function is selectedFiles.length, which is a number.
+        label.innerHTML = `${ICON_UPLOAD}<span>Choose files or drag files/folders here</span>`;
         label.classList.remove("has-file");
         return;
     }
 
-    label.innerHTML = `<svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor"><path d="M2 1.75C2 .784 2.784 0 3.75 0h6.586c.464 0 .909.184 1.237.513l2.914 2.914c.329.328.513.773.513 1.237v9.586A1.75 1.75 0 0 1 13.25 16h-9.5A1.75 1.75 0 0 1 2 14.25Zm1.75-.25a.25.25 0 0 0-.25.25v12.5c0 .138.112.25.25.25h9.5a.25.25 0 0 0 .25-.25V6h-2.75A1.75 1.75 0 0 1 9 4.25V1.5Zm6.75.062V4.25c0 .138.112.25.25.25h2.688l-.011-.013-2.914-2.914-.013-.011Z"/></svg><span>${selectedFiles.length} file(s) ready</span>`;
+    label.innerHTML = `${ICON_FILE}<span>${selectedFiles.length} file(s) ready</span>`;
     label.classList.add("has-file");
-    
+
     commitMsg.value = selectedFiles.length === 1 ? `Add ${selectedFiles[0].customPath}` : `Add ${selectedFiles.length} files`;
     localStorage.setItem(SK.commitMessage, commitMsg.value);
 }
@@ -192,10 +309,7 @@ function initFileDrop() {
 
     input.addEventListener("change", () => {
         if (input.files.length > 0) {
-            selectedFiles = Array.from(input.files).map(f => {
-                f.customPath = f.webkitRelativePath || f.name;
-                return f;
-            });
+            selectedFiles = Array.from(input.files).map(withCustomPath);
             updateFileLabel();
         }
     });
@@ -205,13 +319,11 @@ function initFileDrop() {
     drop.addEventListener("drop", async e => {
         e.preventDefault();
         drop.classList.remove("dragover");
-        if (e.dataTransfer.items) {
-            selectedFiles = await getFilesFromDataTransfer(e.dataTransfer.items);
-        } else if (e.dataTransfer.files) {
-            selectedFiles = Array.from(e.dataTransfer.files).map(f => {
-                f.customPath = f.webkitRelativePath || f.name;
-                return f;
-            });
+        try {
+            selectedFiles = await getFilesFromDataTransfer(e.dataTransfer);
+        } catch (err) {
+            addLog("System", `Failed to read dropped items: ${err.message}`, "error");
+            return;
         }
         updateFileLabel();
     });
@@ -228,94 +340,87 @@ function initCoauthorSearch() {
 
 async function commitMultipleFiles(owner, repo, token, filesData, message, branchName = null) {
     const headers = apiHeaders(token);
-    const base = `https://api.github.com/repos/${owner}/${repo}`;
+    const base = repoApiBase(owner, repo);
 
     let targetBranch = branchName;
     if (!targetBranch) {
-        const repoRes = await fetch(base, { headers });
-        if (!repoRes.ok) throw new Error((await repoRes.json()).message || "Cannot access repo");
-        targetBranch = (await repoRes.json()).default_branch;
+        const repoInfo = await ghFetch(base, { headers }, "Cannot access repository");
+        targetBranch = repoInfo.default_branch;
     }
 
-    const refRes = await fetch(`${base}/git/ref/heads/${targetBranch}`, { headers });
-    if (!refRes.ok) throw new Error("Cannot read branch ref");
-    const latestCommitSha = (await refRes.json()).object.sha;
+    // Branch names come from the API itself or from slugify(), so they are
+    // safe to interpolate raw; slashes in branch names must stay raw here.
+    const refData = await ghFetch(`${base}/git/ref/heads/${targetBranch}`, { headers }, "Cannot read branch ref");
+    const latestCommitSha = refData.object.sha;
 
-    const commitRes = await fetch(`${base}/git/commits/${latestCommitSha}`, { headers });
-    const baseTreeSha = (await commitRes.json()).tree.sha;
+    const commitData = await ghFetch(`${base}/git/commits/${latestCommitSha}`, { headers }, "Cannot read base commit");
+    const baseTreeSha = commitData.tree.sha;
 
-    const tree = [];
-    for (const file of filesData) {
-        const blobRes = await fetch(`${base}/git/blobs`, {
-            method: 'POST',
+    // Blobs are independent of each other: create them in parallel instead of
+    // paying one network round trip per file per repository.
+    const tree = await Promise.all(filesData.map(async file => {
+        const blob = await ghFetch(`${base}/git/blobs`, {
+            method: "POST",
             headers,
-            body: JSON.stringify({ content: file.content, encoding: 'base64' })
-        });
-        if (!blobRes.ok) throw new Error("Failed to create blob for " + file.path);
-        
-        tree.push({
-            path: file.path,
-            mode: '100644',
-            type: 'blob',
-            sha: (await blobRes.json()).sha
-        });
-    }
+            body: JSON.stringify({ content: file.content, encoding: "base64" })
+        }, `Failed to create blob for ${file.path}`);
+        return { path: file.path, mode: "100644", type: "blob", sha: blob.sha };
+    }));
 
-    const createTreeRes = await fetch(`${base}/git/trees`, {
-        method: 'POST',
+    const newTree = await ghFetch(`${base}/git/trees`, {
+        method: "POST",
         headers,
         body: JSON.stringify({ base_tree: baseTreeSha, tree })
-    });
-    if (!createTreeRes.ok) throw new Error("Failed to create tree structure");
-    const newTreeData = await createTreeRes.json();
+    }, "Failed to create tree structure");
 
-    const createCommitRes = await fetch(`${base}/git/commits`, {
-        method: 'POST',
+    const newCommit = await ghFetch(`${base}/git/commits`, {
+        method: "POST",
         headers,
-        body: JSON.stringify({
-            message: message,
-            tree: newTreeData.sha,
-            parents: [latestCommitSha]
-        })
-    });
-    if (!createCommitRes.ok) throw new Error("Failed to create commit");
-    const newCommitData = await createCommitRes.json();
+        body: JSON.stringify({ message, tree: newTree.sha, parents: [latestCommitSha] })
+    }, "Failed to create commit");
 
-    const updateRefRes = await fetch(`${base}/git/refs/heads/${targetBranch}`, {
-        method: 'PATCH',
+    // force: false keeps the update strictly fast-forward, so a concurrent push
+    // on the target branch can never be silently overwritten.
+    await ghFetch(`${base}/git/refs/heads/${targetBranch}`, {
+        method: "PATCH",
         headers,
-        body: JSON.stringify({ sha: newCommitData.sha })
-    });
-    if (!updateRefRes.ok) throw new Error("Failed to update branch reference");
+        body: JSON.stringify({ sha: newCommit.sha, force: false })
+    }, "Failed to update branch reference");
 
-    return { action: "committed", url: newCommitData.html_url };
+    return { action: "committed", url: newCommit.html_url };
 }
 
 async function createPRMultipleFiles(owner, repo, token, filesData, commitMsg, prBranch, prTitle, prBody) {
     const headers = apiHeaders(token);
-    const base = `https://api.github.com/repos/${owner}/${repo}`;
+    const base = repoApiBase(owner, repo);
 
-    const repoRes = await fetch(base, { headers });
-    if (!repoRes.ok) throw new Error((await repoRes.json()).message || "Cannot access repo");
-    const defaultBranch = (await repoRes.json()).default_branch;
+    const repoInfo = await ghFetch(base, { headers }, "Cannot access repository");
+    const defaultBranch = repoInfo.default_branch;
 
-    const refRes = await fetch(`${base}/git/ref/heads/${defaultBranch}`, { headers });
-    if (!refRes.ok) throw new Error("Cannot read default branch ref");
-    const baseSha = (await refRes.json()).object.sha;
+    const refData = await ghFetch(`${base}/git/ref/heads/${defaultBranch}`, { headers }, "Cannot read default branch ref");
+    const baseSha = refData.object.sha;
 
-    const branch = prBranch ? slugify(prBranch) : `deploy-${Date.now()}`;
+    // slugify() can legitimately produce an empty string; fall back to a
+    // timestamped name so the ref is always valid.
+    const branch = (prBranch ? slugify(prBranch) : "") || `deploy-${Date.now()}`;
     const createRefRes = await fetch(`${base}/git/refs`, {
         method: "POST",
         headers,
         body: JSON.stringify({ ref: `refs/heads/${branch}`, sha: baseSha })
     });
     if (!createRefRes.ok) {
-        throw new Error((await createRefRes.json()).message || "Failed to create branch");
+        const err = await apiError(createRefRes, "Failed to create branch");
+        // 422 "already exists" means a previous run left the branch behind or
+        // the user re-ran with the same name: reuse it so repeated deploys are
+        // idempotent instead of failing outright.
+        if (!(createRefRes.status === 422 && /already exists/i.test(err.message))) {
+            throw err;
+        }
     }
 
     await commitMultipleFiles(owner, repo, token, filesData, commitMsg, branch);
 
-    const prRes = await fetch(`${base}/pulls`, {
+    const pr = await ghFetch(`${base}/pulls`, {
         method: "POST",
         headers,
         body: JSON.stringify({
@@ -324,11 +429,27 @@ async function createPRMultipleFiles(owner, repo, token, filesData, commitMsg, p
             head: branch,
             base: defaultBranch
         })
-    });
+    }, "Failed to create PR");
 
-    if (!prRes.ok) throw new Error((await prRes.json()).message || "Failed to create PR");
-    const prData = await prRes.json();
-    return { url: prData.html_url, number: prData.number };
+    return { url: pr.html_url, number: pr.number };
+}
+
+function readFileAsBase64(file) {
+    return new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = () => {
+            // readAsDataURL produces "data:<mime>;base64,<payload>"; strip the header.
+            const result = String(reader.result || "");
+            const comma = result.indexOf(",");
+            if (comma === -1) {
+                reject(new Error(`Could not encode file "${file.name}"`));
+                return;
+            }
+            resolve(result.slice(comma + 1));
+        };
+        reader.onerror = () => reject(new Error(`Could not read file "${file.name}"`));
+        reader.readAsDataURL(file);
+    });
 }
 
 document.addEventListener("DOMContentLoaded", () => {
@@ -336,7 +457,7 @@ document.addEventListener("DOMContentLoaded", () => {
     buildCoauthorGrid();
     initFileDrop();
     initCoauthorSearch();
-    ["repoList", "apiToken", "commitMessage", "extendedDescription", "prBranch", "prTitle", "prBody"].forEach(persist);
+    PERSISTED_IDS.forEach(persist);
 
     document.querySelectorAll("#deployMethod .seg-btn").forEach(btn => {
         btn.addEventListener("click", () => setDeployMethod(btn.dataset.value));
@@ -353,7 +474,7 @@ document.addEventListener("DOMContentLoaded", () => {
         const statusLog = $("statusLog");
         const submitBtn = $("submitBtn");
 
-        statusLog.innerHTML = "";
+        statusLog.textContent = "";
 
         if (selectedFiles.length === 0) {
             addLog("System", "Please select files or drag folders.", "error");
@@ -367,23 +488,31 @@ document.addEventListener("DOMContentLoaded", () => {
 
         const progressTrack = document.createElement("div");
         progressTrack.className = "progress-bar-track";
-        progressTrack.innerHTML = '<div class="progress-bar-fill"></div>';
+        const progressFill = document.createElement("div");
+        progressFill.className = "progress-bar-fill";
+        progressTrack.appendChild(progressFill);
         statusLog.appendChild(progressTrack);
 
         try {
-            const filesData = await Promise.all(selectedFiles.map(async f => {
-                const b64 = await new Promise((resolve) => {
-                    const reader = new FileReader();
-                    reader.onload = event => {
-                        const base64 = event.target.result.split(',')[1];
-                        resolve(base64);
-                    };
-                    reader.readAsDataURL(f);
-                });
-                return { path: f.customPath || f.name, content: b64 };
-            }));
+            // Read and encode every file once, then reuse for all repositories.
+            let filesData = await Promise.all(selectedFiles.map(async file => ({
+                path: sanitizeRepoPath(file.customPath || file.name),
+                content: await readFileAsBase64(file)
+            })));
 
-            let msgParts = [commitMessage];
+            // Drop entries whose path became empty after sanitization, then
+            // de-duplicate paths (last one wins) because the tree API rejects
+            // duplicate entries.
+            const skipped = filesData.length;
+            filesData = [...new Map(filesData.filter(f => f.path).map(f => [f.path, f])).values()];
+            if (filesData.length < skipped) {
+                addLog("System", `Skipped ${skipped - filesData.length} file(s) with duplicate or unusable paths.`, "warn");
+            }
+            if (filesData.length === 0) {
+                throw new Error("No usable files remain after path checks");
+            }
+
+            const msgParts = [commitMessage];
             if (extendedDesc) msgParts.push(extendedDesc);
             const coauthorLines = getCoauthorTrailers();
             if (coauthorLines.length) msgParts.push(coauthorLines.join("\n"));
@@ -391,6 +520,12 @@ document.addEventListener("DOMContentLoaded", () => {
 
             const modeLabel = method === "pr" ? "pull requests" : "commits";
             addLog("System", `Deploying ${filesData.length} item(s) as ${modeLabel} to ${repos.length} repositor${repos.length === 1 ? "y" : "ies"}`, "info");
+
+            // Read PR options once; they cannot change while the deploy runs.
+            const prBranch = $("prBranch").value.trim();
+            const prTitle = $("prTitle").value.trim();
+            const prBody = $("prBody").value.trim();
+            const seenRepos = new Set();
 
             for (let i = 0; i < repos.length; i++) {
                 const parsed = parseRepo(repos[i]);
@@ -400,17 +535,22 @@ document.addEventListener("DOMContentLoaded", () => {
                     continue;
                 }
                 const name = `${parsed.owner}/${parsed.repo}`;
-                
+
+                // One deploy per repository, regardless of casing or duplicates.
+                if (seenRepos.has(name.toLowerCase())) {
+                    addLog(name, "Duplicate entry; skipped.", "warn");
+                    updateProgress(i + 1, repos.length);
+                    continue;
+                }
+                seenRepos.add(name.toLowerCase());
+
                 try {
                     if (method === "pr") {
-                        const prBranch = $("prBranch").value.trim();
-                        const prTitle = $("prTitle").value.trim();
-                        const prBody = $("prBody").value.trim();
                         const result = await createPRMultipleFiles(parsed.owner, parsed.repo, token, filesData, fullMessage, prBranch, prTitle || commitMessage, prBody);
-                        addLog(name, `PR #${result.number} created &mdash; <a href="${result.url}" target="_blank" rel="noopener">view</a>`, "success");
+                        addLog(name, `PR #${result.number} created`, "success", { url: result.url, label: "view" });
                     } else {
                         const result = await commitMultipleFiles(parsed.owner, parsed.repo, token, filesData, fullMessage);
-                        addLog(name, `${result.action} &mdash; <a href="${result.url}" target="_blank" rel="noopener">view commit</a>`, "success");
+                        addLog(name, result.action, "success", { url: result.url, label: "view commit" });
                     }
                 } catch (err) {
                     addLog(name, err.message, "error");
@@ -418,7 +558,7 @@ document.addEventListener("DOMContentLoaded", () => {
                 updateProgress(i + 1, repos.length);
             }
         } catch (error) {
-            addLog("System", "Failed to process files: " + error.message, "error");
+            addLog("System", `Failed to process files: ${error.message}`, "error");
         }
 
         submitBtn.disabled = false;
